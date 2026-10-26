@@ -4,8 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
 };
 
-pub const REFERRAL_REWARD_DISTRIBUTED_EVENT_NAME: soroban_sdk::Symbol =
-    symbol_short!("ref_dist");
+pub const REFERRAL_REWARD_DISTRIBUTED_EVENT_NAME: soroban_sdk::Symbol = symbol_short!("ref_dist");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -100,11 +99,7 @@ impl ReferralContract {
     }
 
     /// Accrue 40%, 20%, and 10% of the referral fee allocation to tiers 1-3.
-    pub fn on_swap_fee(
-        env: Env,
-        wallet: Address,
-        fee_amount: i128,
-    ) -> Result<(), ContractError> {
+    pub fn on_swap_fee(env: Env, wallet: Address, fee_amount: i128) -> Result<(), ContractError> {
         wallet.require_auth();
         if fee_amount < 0 {
             return Err(ContractError::InvalidFeeAmount);
@@ -128,9 +123,7 @@ impl ReferralContract {
                 .checked_add(amount)
                 .ok_or(ContractError::ArithmeticOverflow)?;
 
-            env.storage()
-                .persistent()
-                .set(&key, &updated_balance);
+            env.storage().persistent().set(&key, &updated_balance);
             env.events().publish(
                 (
                     REFERRAL_REWARD_DISTRIBUTED_EVENT_NAME,
@@ -229,10 +222,7 @@ mod test {
             let event_name = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
             if event_name == REFERRAL_REWARD_DISTRIBUTED_EVENT_NAME {
                 let event = ReferralRewardDistributed::try_from_val(&env, &data).unwrap();
-                assert_eq!(
-                    topics.get(1),
-                    Some(event.referrer.clone().into_val(&env))
-                );
+                assert_eq!(topics.get(1), Some(event.referrer.clone().into_val(&env)));
                 assert_eq!(topics.get(2), Some(event.tier.into_val(&env)));
                 assert_eq!(event.referrer, chain.get(event.tier - 1).unwrap());
                 assert_eq!(event.amount, [40, 20, 10][(event.tier - 1) as usize]);
