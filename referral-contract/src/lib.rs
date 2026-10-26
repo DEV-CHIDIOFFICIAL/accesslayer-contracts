@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
 /// Event name emitted when a referrer's tier is upgraded.
@@ -9,6 +9,9 @@ pub const REFERRAL_TIER_UPGRADED_EVENT_NAME: Symbol = symbol_short!("tier_upg");
 
 /// Event name emitted when referral rewards are accrued.
 pub const REFERRAL_REWARD_ACCRUED_EVENT_NAME: Symbol = symbol_short!("ref_rwd");
+
+/// Event name emitted when a multi-level referral reward is distributed.
+pub const REFERRAL_REWARD_DISTRIBUTED_EVENT_NAME: Symbol = symbol_short!("ref_dist");
 
 /// Event name emitted when referral rewards are claimed.
 pub const REFERRAL_REWARDS_CLAIMED_EVENT_NAME: Symbol = symbol_short!("ref_clm");
@@ -31,6 +34,7 @@ pub const DEFAULT_GOLD_THRESHOLD: i128 = 1_000_000;
 /// Default reward rate for Gold tier: 1,500 bps (15.00%).
 pub const DEFAULT_GOLD_BPS: u32 = 1_500;
 
+// New variants must be appended at the end; discriminants are part of the ABI.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -42,6 +46,9 @@ pub enum ContractError {
     NotPositiveAmount = 5,
     ArithmeticOverflow = 6,
     NoRewardsPending = 7,
+    SelfReferral = 8,
+    ReferralAlreadyRegistered = 9,
+    InvalidFeeAmount = 10,
 }
 
 /// Referral tiers in ascending rank and reward rate.
@@ -92,6 +99,15 @@ pub struct ReferralRewardAccrued {
     pub amount: i128,
     pub tier: ReferralTier,
     pub reward_rate_bps: u32,
+}
+
+/// Event data payload emitted when a referral reward is distributed to a chain level.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ReferralRewardDistributed {
+    pub tier: u32,
+    pub referrer: Address,
+    pub amount: i128,
 }
 
 /// Event data payload emitted when referral rewards are claimed.
@@ -215,7 +231,7 @@ impl ReferralContract {
 
         for (index, referrer) in chain.iter().enumerate() {
             let amount = fee_amount
-                .checked_mul(percentages[index as usize])
+                .checked_mul(percentages[index])
                 .ok_or(ContractError::ArithmeticOverflow)?
                 / 100;
             let key = DataKey::RewardBalance(referrer.clone());
