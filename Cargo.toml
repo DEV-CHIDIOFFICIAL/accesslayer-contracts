@@ -13,6 +13,8 @@ members = [
     "seasonal-rewards",
     "auto-invest-registry",
     "key-analytics",
+    "dividend-contract",
+    "subscription-contract",
 ]
 resolver = "2"
 

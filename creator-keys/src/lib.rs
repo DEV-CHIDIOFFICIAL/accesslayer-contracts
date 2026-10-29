@@ -74,6 +74,7 @@ pub mod community_polls;
 pub mod curve_subscriptions_swaps;
 pub mod dynamic_fees;
 pub mod emergency_pause;
+pub mod performance_bonds;
 
 pub mod key_freeze;
 pub mod key_ownership_transfer;
@@ -83,6 +84,7 @@ pub mod protocol_governance;
 pub mod proxy;
 pub mod ratings_royalties_dividends;
 pub mod supply_milestones;
+pub mod timed_pause;
 pub use proxy::{BondingCurveProxy, BondingCurveProxyClient};
 pub mod vote_delegation;
 pub use vote_delegation::VoteDelegationKey;
@@ -338,7 +340,7 @@ pub enum ContractError {
     NotAHolder = 133,
     // --- Key retirement with admin-funded holder buyback at floor price (Issue #1111) ---
     /// No retirement proposal has been made for the supplied key.
-    NoRetirementProposed = 148,
+    NoRetirementProposed = 142,
     /// A retirement proposal already exists for the supplied key.
     RetirementAlreadyProposed = 143,
     /// `execute_retirement` was called before the 7-day notice window elapsed.
@@ -372,7 +374,13 @@ pub enum ContractError {
     /// The key is not frozen, so there is nothing to unfreeze.
     KeyNotFrozen = 141,
     /// Trading for the creator key is suspended by its circuit breaker.
-    CircuitBreakerActive = 149,
+    CircuitBreakerActive = 148,
+    /// A passed governance proposal could not complete its bond action.
+    BondExecutionFailed = 149,
+    /// Trading is disabled until the creator escrows the required performance bond.
+    PerformanceBondRequired = 150,
+    /// An admin's bounded platform halt is active; query `get_platform_pause` for context.
+    PlatformPaused = 151,
 }
 
 impl ContractError {
@@ -432,6 +440,10 @@ pub enum FeatureError {
     InvalidAuctionConfig = 6,
     /// `cancel_auction` or `buy_key` (auction path) but no auction is configured.
     NoAuctionConfigured = 7,
+    /// A one-time key configuration has already been stored.
+    AlreadyConfigured = 8,
+    /// Supply slope tiers are empty, too numerous, unsorted, or negative.
+    InvalidCurveMilestones = 9,
 }
 
 /// Errors raised by the buy-cooldown entrypoints
@@ -2346,6 +2358,14 @@ pub enum FeatureKey {
     MergeVote(u32, Address),
     MergeSnapshotWeight(u32, Address),
     MergeHolders(u32),
+    /// Configured XLM Stellar Asset Contract address.
+    XlmTokenAddress,
+    /// (creator) -> cumulative slashed bond amount in stroops.
+    BondSlashed(Address),
+    /// (creator) -> cumulative released bond amount in stroops.
+    BondReleased(Address),
+    /// (creator) -> immutable supply-triggered curve-slope milestone config.
+    CurveSlopeMilestones(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4009,12 +4029,12 @@ fn read_required_effective_fee_config(env: &Env) -> Result<fee::FeeConfig, Contr
 
 /// Resolves the curve slope that applies to `creator`.
 ///
-/// A creator that has been through [`CreatorKeysContract::reset_curve`] carries a
-/// per-creator slope override, which takes precedence over the global slope. Every
-/// other creator inherits the global slope, so resetting one creator cannot move
-/// another creator's pricing.
-fn resolve_curve_slope(env: &Env, creator: &Address) -> i128 {
-    read_creator_slope(env, creator).unwrap_or_else(|| read_curve_slope(env))
+/// A reached supply milestone takes precedence over the creator's reset override;
+/// otherwise the reset override takes precedence over the protocol-wide slope.
+pub(crate) fn resolve_curve_slope(env: &Env, creator: &Address) -> i128 {
+    supply_milestones::curve_slope_override(env, creator)
+        .or_else(|| read_creator_slope(env, creator))
+        .unwrap_or_else(|| read_curve_slope(env))
 }
 
 fn read_protocol_fee_config(env: &Env) -> Option<fee::FeeConfig> {
@@ -6468,6 +6488,20 @@ pub enum BondError {
     Overflow = 5,
     /// The bond amount is not positive.
     NotPositiveAmount = 6,
+    /// No XLM Stellar Asset Contract has been configured.
+    TokenNotConfigured = 7,
+    /// The XLM token address can only be configured once.
+    TokenAlreadyConfigured = 8,
+    /// The creator has already deposited a bond.
+    AlreadyDeposited = 9,
+    /// The slash basis points are outside `1..=10_000`.
+    InvalidSlashBps = 10,
+    /// The key has not completed deprecation.
+    NotDeprecated = 11,
+    /// No treasury address has been configured for slashed XLM.
+    TreasuryNotConfigured = 12,
+    /// A key has already traded and can no longer make its initial bond deposit.
+    AlreadyTrading = 13,
 }
 
 /// Errors raised by [`CreatorKeysContract::atomic_swap`].
@@ -6989,6 +7023,8 @@ impl CreatorKeysContract {
             return Err(ContractError::NotPositiveAmount);
         }
 
+        performance_bonds::assert_trade_eligible(&env, &creator)?;
+
         if let Some(ref referrer_addr) = referrer {
             if *referrer_addr == buyer || *referrer_addr == creator {
                 return Err(ContractError::InvalidReferrer);
@@ -7232,6 +7268,7 @@ impl CreatorKeysContract {
             emit_milestone_crossings(&env, &creator, profile.supply - 1, profile.supply)?;
             // Apply any newly reached graduated supply milestone (fee reduction).
             supply_milestones::check_and_apply_milestone(&env, &creator)?;
+            supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
 
             // Record the key creation ledger on the first buy for launch penalty tracking.
             if profile.supply == 1 {
@@ -7556,6 +7593,7 @@ impl CreatorKeysContract {
             return Err(ContractError::KeyDeprecated);
         }
         assert_key_not_deprecating(&env, &creator)?;
+        performance_bonds::assert_trade_eligible(&env, &creator)?;
 
         if payment <= 0 {
             return Err(ContractError::NotPositiveAmount);
@@ -7818,6 +7856,7 @@ impl CreatorKeysContract {
         emit_milestone_crossings(&env, &creator, profile.supply - 1, profile.supply)?;
         // Apply any newly reached graduated supply milestone (fee reduction).
         supply_milestones::check_and_apply_milestone(&env, &creator)?;
+        supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
 
         // Record the key creation ledger on the first buy for launch penalty tracking.
         if profile.supply == 1 {
@@ -8207,6 +8246,7 @@ impl CreatorKeysContract {
         write_creator_supply(&env, &creator, profile.supply);
         // Apply any newly reached graduated supply milestone (fee reduction).
         supply_milestones::check_and_apply_milestone(&env, &creator)?;
+        supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
         if new_balance == 0 {
             env.storage().persistent().remove(&balance_key);
             env.storage()
@@ -8492,6 +8532,8 @@ impl CreatorKeysContract {
             .persistent()
             .set(&dep_key, &buyback_price_per_key);
         extend_key_ttl_to_full_window(&env, &dep_key);
+        performance_bonds::release_after_deprecation(&env, &creator)
+            .map_err(|_| ContractError::BondExecutionFailed)?;
 
         // Persist the escrow balance (capped at required_escrow; any overpayment
         // is treated as excess and not credited to the escrow pool).
@@ -8765,6 +8807,8 @@ impl CreatorKeysContract {
             .persistent()
             .set(&deprecated_key, &unwind_price);
         extend_key_ttl_to_full_window(&env, &deprecated_key);
+        performance_bonds::release_after_deprecation(&env, &key_id)
+            .map_err(|_| ContractError::BondExecutionFailed)?;
 
         proposal.executed = true;
         env.storage().persistent().set(&key, &proposal);
@@ -9056,6 +9100,8 @@ impl CreatorKeysContract {
             .persistent()
             .set(&deprecated_key, &buyback_price);
         extend_key_ttl_to_full_window(&env, &deprecated_key);
+        performance_bonds::release_after_deprecation(&env, &key_id)
+            .map_err(|_| ContractError::BondExecutionFailed)?;
 
         // Deduct spent amount from the pool; remove key when drained.
         let remaining_pool = pool_balance
@@ -9489,6 +9535,24 @@ impl CreatorKeysContract {
     /// tiers reached) and the fee bps currently in effect for `key_id`.
     pub fn get_current_milestone(env: Env, key_id: Address) -> Result<(u32, u32), ContractError> {
         supply_milestones::get_current_milestone(&env, &key_id)
+    }
+
+    /// Configure the immutable bonding-curve slope schedule for a key.
+    pub fn set_curve_slope_milestones(
+        env: Env,
+        admin: Address,
+        key_id: Address,
+        tiers: Vec<supply_milestones::CurveSlopeTier>,
+    ) -> Result<(), FeatureError> {
+        supply_milestones::set_curve_slope_milestones(&env, &admin, &key_id, tiers)
+    }
+
+    /// Read the active slope milestone index and effective per-key curve slope.
+    pub fn current_curve_slope_milestone(
+        env: Env,
+        key_id: Address,
+    ) -> Result<(u32, i128), ContractError> {
+        supply_milestones::get_current_curve_slope_milestone(&env, &key_id)
     }
 
     /// Stages a timelocked upgrade of the contract's logic build and returns the
@@ -12397,6 +12461,47 @@ impl CreatorKeysContract {
             .get(&constants::storage::TREASURY_ADDRESS)
     }
 
+    /// Configure the network-specific XLM Stellar Asset Contract used for bonds.
+    pub fn set_xlm_token_address(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<(), BondError> {
+        performance_bonds::set_xlm_token_address(&env, &admin, &token_address)
+    }
+
+    /// Set the minimum XLM bond required from a key creator.
+    pub fn set_min_performance_bond(
+        env: Env,
+        admin: Address,
+        amount: i128,
+    ) -> Result<(), BondError> {
+        performance_bonds::set_minimum_bond(&env, &admin, amount)
+    }
+
+    /// Deposit XLM collateral for a registered key. Call atomically with key
+    /// registration so the key cannot trade before its bond is escrowed.
+    pub fn deposit_performance_bond(
+        env: Env,
+        key_id: Address,
+        amount: i128,
+    ) -> Result<(), BondError> {
+        performance_bonds::deposit(&env, &key_id, amount)
+    }
+
+    /// Return the deposited, slashed, and currently releasable XLM amounts.
+    pub fn get_bond_status(
+        env: Env,
+        key_id: Address,
+    ) -> Result<performance_bonds::BondStatus, BondError> {
+        performance_bonds::get_status(&env, &key_id)
+    }
+
+    /// Release any remaining bond after a key has been deprecated.
+    pub fn finalize_deprecation(env: Env, key_id: Address) -> Result<i128, BondError> {
+        performance_bonds::finalize_deprecation(&env, &key_id)
+    }
+
     /// Configures the protocol trade fee charged on every buy and sell.
     ///
     /// The fee is deducted from the trade amount before the creator payout is
@@ -13009,6 +13114,8 @@ impl CreatorKeysContract {
         direction: SwapDirection,
         max_slippage_bps: u32,
     ) -> Result<i128, ContractError> {
+        timed_pause::assert_not_paused(&env)?;
+        assert_not_paused(&env)?;
         if amount == 0 {
             return Err(ContractError::NotPositiveAmount);
         }
